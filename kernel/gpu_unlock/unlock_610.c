@@ -377,9 +377,30 @@ static int unlock_transaction_unwind(struct unlock_transaction_work *work)
 		pci_clear_master(work->pdev);
 		work->master = false;
 		work->retained = true;
+		/* Hypervisor passthrough masks FLR, so the post-unlock reset that
+		 * would clear WPR2 and quiesce the card never runs. WPR2 stays
+		 * enabled and the stock driver refuses it (HI.VAL != 0), so the
+		 * handover must wait for a reboot: its device reset clears WPR2
+		 * while the PLM selectors persist, and the next boot re-enters
+		 * via -EALREADY. The unlock itself already latched, so report
+		 * success with retention rather than a misleading failure. */
+		if (work->no_flr && work->invocation_halted) {
+			u32 ss0 = 0, ss1 = 0;
+
+			read_bar(work, work->card->family->feat_ss0, &ss0);
+			read_bar(work, work->card->family->feat_ss1, &ss1);
+			if (ss0 == GU_SS0_UNLOCK && ss1 == GU_SS1_UNLOCK) {
+				dev_warn(&work->pdev->dev,
+					 "gpu_unlock: unlock latched (ss0=%#x ss1=%#x); FLR unavailable (hypervisor passthrough), handover deferred to next boot; DMA buffers retained until power off\n",
+					 ss0, ss1);
+				return 0;
+			}
+		}
 		ret = diag_pci_word(work, false, PCI_COMMAND, &now);
-		dev_err(&work->pdev->dev, "handover refused: incomplete transaction; BME_off=%u command=%#x config_result=%d; BAR ownership and DMA buffers retained until power off\n",
-			!ret && now != 0xffff && !(now & PCI_COMMAND_MASTER), now, ret);
+		dev_err(&work->pdev->dev, "handover refused: incomplete transaction; BME_off=%u command=%#x config_result=%d no_flr=%u halted=%u quiesced=%u state=%u; BAR ownership and DMA buffers retained until power off\n",
+			!ret && now != 0xffff && !(now & PCI_COMMAND_MASTER), now, ret,
+			work->no_flr, work->invocation_halted, work->state == GU_QUIESCED,
+			work->state);
 		return GU_RESULT(-EBUSY);
 	}
 	if (work->master) {
@@ -1495,8 +1516,12 @@ static int unlock_transaction_reset(struct unlock_transaction_work *work)
 	 * this point; skip the reset and let the unwind retain the DMA buffers and
 	 * pin the module until power off. */
 	if (work->no_flr) {
+		read_bar(work, GU_WPR2_ADDR_LO_OFFSET, &lo);
+		read_bar(work, GU_WPR2_ADDR_HI_OFFSET, &hi);
+		read_bar(work, work->card->family->feat_plm, &plm);
 		dev_warn(&work->pdev->dev,
-			 "gpu_unlock: FLR unavailable; skipping post-unlock reset (module will pin until power off)\n");
+			 "gpu_unlock: unlock latched; FLR unavailable (hypervisor passthrough), handover deferred to next boot; wpr2=%#x:%#x plm_feat=%#x\n",
+			 lo, hi, plm);
 		return 0;
 	}
 	if (read_bar(work, work->card->family->feat_ss0, &ss0) || ss0 == ~0u ||
@@ -1540,6 +1565,7 @@ static int unlock_transaction_reset(struct unlock_transaction_work *work)
 		/* Hypervisor passthrough rejects FLR with -EBUSY. The unlock
 		 * selectors are already latched by this point; skip the post-FLR
 		 * reset and let the module pin itself until power-off. */
+		work->no_flr = true;
 		dev_warn(&work->pdev->dev,
 			 "gpu_unlock: FLR failed (%d); hypervisor passthrough, skipping post-FLR reset\n",
 			 ret);
@@ -1693,9 +1719,14 @@ int gpu_unlock_610_unlock(const struct gu_device *device, const struct gpu_unloc
 		 ret, work->state, work->retained, work->pages_allocated,
 		 work->page_count, cleanup);
 	if (work->retained) {
-		/* Firmware may still DMA into these buffers: keep them, the device
-		 * reference and this module until the next power off. */
-		dev_err(&pdev->dev, "firmware did not stop; keeping its DMA buffers until power off\n");
+		/* Either firmware may still DMA into these buffers, or the unlock
+		 * latched but FLR is unavailable; in both cases keep them, the
+		 * device reference and this module until the next power off. */
+		if (work->no_flr && ret >= 0)
+			dev_info(&pdev->dev,
+				 "gpu_unlock: unlock latched; handover deferred, buffers kept until power off; reboot the VM to attach nvidia to the unlocked card\n");
+		else if (ret < 0)
+			dev_err(&pdev->dev, "firmware did not stop; keeping its DMA buffers until power off\n");
 		__module_get(THIS_MODULE);
 		return ret;
 	}
