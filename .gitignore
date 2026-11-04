@@ -26,3 +26,5 @@
 modules.order
 Module.symvers
 packaging/*/NVIDIA-Linux-x86_64-610.43.03-no-compat32.run
+/benchmark/gemm_bf16
+/benchmark/gemm_fp16
