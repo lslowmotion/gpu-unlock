@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Simple BF16 dense GEMM with FP32 accumulation, to confirm a gpu-unlock.
+ * BF16 / FP16 / TF32 dense GEMM with FP32 accumulation, to confirm a gpu-unlock.
  *
  * The unlock doubles FP16/BF16/TF32 tensor-core throughput with FP32
  * accumulation.  A locked card runs these at half rate, an unlocked card at
@@ -8,18 +8,19 @@
  * table for your card.
  *
  * Build (requires CUDA toolkit + cuBLAS):
- *   nvcc -O3 -arch=sm_86 gemm_fp16.cu -lcublas -o gemm_bf16
+ *   nvcc -O3 -arch=sm_86 gemm_fp16.cu -lcublas -o gemm
  *
  * Run:
- *   ./gemm_bf16 [size] [iters]
+ *   ./gemm [size] [iters]
  *
- * Example (RTX 3080, unlocked):  ./gemm_bf16 8192 20
+ * Example (RTX 3080, unlocked):  ./gemm 8192 20
  */
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #define CHECK_CUDA(call) do { \
     cudaError_t e = (call); \
@@ -37,6 +38,47 @@
         exit(1); \
     } \
 } while (0)
+
+/* Time one GEMM type and print its TFLOPS.  alpha is a pointer to the
+ * scalar in the matching input type (__nv_bfloat16, __half, or float). */
+static void run_gemm(cublasHandle_t h, int n, int iters, const char *name,
+                     cudaDataType_t dtype, size_t abytes, void *A, void *B,
+                     float *C, const void *alpha)
+{
+    float beta = 0.0f;
+
+    // Warm up.
+    CHECK_CUBLAS(cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, alpha,
+                              A, dtype, n, B, dtype, n, &beta,
+                              C, CUDA_R_32F, n, CUBLAS_COMPUTE_32F,
+                              CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+    // Time the GEMMs.
+    cudaEvent_t start, stop;
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+    CHECK_CUDA(cudaEventRecord(start));
+    for (int i = 0; i < iters; i++) {
+        CHECK_CUBLAS(cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, alpha,
+                                  A, dtype, n, B, dtype, n, &beta,
+                                  C, CUDA_R_32F, n, CUBLAS_COMPUTE_32F,
+                                  CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
+    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaEventSynchronize(stop));
+
+    float ms;
+    CHECK_CUDA(cudaEventElapsedTime(&ms, start, stop));
+    double flops = 2.0 * (double)n * n * n * iters;
+    double tflops = flops / (ms * 1e-3) / 1e12;
+
+    printf("GEMM %dx%d %s (FP32 accum), %d iters: %.1f ms total (%.2f ms each)\n",
+           n, n, name, iters, ms, ms / iters);
+    printf("%s tensor throughput: %.1f TFLOPS\n", name, tflops);
+
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
+}
 
 int main(int argc, char **argv)
 {
@@ -57,65 +99,84 @@ int main(int argc, char **argv)
     CHECK_CUBLAS(cublasCreate(&h));
 
     size_t nbytes = (size_t)n * n;
-    size_t abytes = nbytes * sizeof(__nv_bfloat16);
     size_t cbytes = nbytes * sizeof(float);
-    __nv_bfloat16 *A, *B;
     float *C;
-    CHECK_CUDA(cudaMalloc(&A, abytes));
-    CHECK_CUDA(cudaMalloc(&B, abytes));
     CHECK_CUDA(cudaMalloc(&C, cbytes));
     CHECK_CUDA(cudaMemset(C, 0, cbytes));
 
-    // Fill with small values to avoid overflow in accumulation.
-    __nv_bfloat16 *hA = (__nv_bfloat16 *)malloc(abytes);
-    __nv_bfloat16 *hB = (__nv_bfloat16 *)malloc(abytes);
-    for (size_t i = 0; i < nbytes; i++) {
-        hA[i] = __float2bfloat16(0.5f);
-        hB[i] = __float2bfloat16(0.5f);
+    // ---- BF16: 16-bit bfloat inputs, FP32 accumulation. ----
+    {
+        size_t abytes = nbytes * sizeof(__nv_bfloat16);
+        __nv_bfloat16 *A, *B;
+        CHECK_CUDA(cudaMalloc(&A, abytes));
+        CHECK_CUDA(cudaMalloc(&B, abytes));
+        __nv_bfloat16 *hA = (__nv_bfloat16 *)malloc(abytes);
+        __nv_bfloat16 *hB = (__nv_bfloat16 *)malloc(abytes);
+        for (size_t i = 0; i < nbytes; i++) {
+            hA[i] = __float2bfloat16(0.5f);
+            hB[i] = __float2bfloat16(0.5f);
+        }
+        CHECK_CUDA(cudaMemcpy(A, hA, abytes, cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(B, hB, abytes, cudaMemcpyHostToDevice));
+        __nv_bfloat16 alpha = __float2bfloat16(1.0f);
+        run_gemm(h, n, iters, "BF16", CUDA_R_16BF, abytes, A, B, C, &alpha);
+        free(hA);
+        free(hB);
+        CHECK_CUDA(cudaFree(A));
+        CHECK_CUDA(cudaFree(B));
     }
-    CHECK_CUDA(cudaMemcpy(A, hA, abytes, cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(B, hB, abytes, cudaMemcpyHostToDevice));
 
-    // BF16 inputs, FP32 accumulation (the rate the unlock doubles).
-    __nv_bfloat16 alpha = __float2bfloat16(1.0f);
-    float beta = 0.0f;
-
-    // Warm up.
-    CHECK_CUBLAS(cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, &alpha,
-                              A, CUDA_R_16BF, n, B, CUDA_R_16BF, n, &beta,
-                              C, CUDA_R_32F, n, CUBLAS_COMPUTE_32F,
-                              CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-
-    // Time the GEMMs.
-    cudaEvent_t start, stop;
-    CHECK_CUDA(cudaEventCreate(&start));
-    CHECK_CUDA(cudaEventCreate(&stop));
-    CHECK_CUDA(cudaEventRecord(start));
-    for (int i = 0; i < iters; i++) {
-        CHECK_CUBLAS(cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, &alpha,
-                                  A, CUDA_R_16BF, n, B, CUDA_R_16BF, n, &beta,
-                                  C, CUDA_R_32F, n, CUBLAS_COMPUTE_32F,
-                                  CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    // ---- FP16: 16-bit half inputs, FP32 accumulation. ----
+    {
+        size_t abytes = nbytes * sizeof(__half);
+        __half *A, *B;
+        CHECK_CUDA(cudaMalloc(&A, abytes));
+        CHECK_CUDA(cudaMalloc(&B, abytes));
+        __half *hA = (__half *)malloc(abytes);
+        __half *hB = (__half *)malloc(abytes);
+        for (size_t i = 0; i < nbytes; i++) {
+            hA[i] = __float2half(0.5f);
+            hB[i] = __float2half(0.5f);
+        }
+        CHECK_CUDA(cudaMemcpy(A, hA, abytes, cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(B, hB, abytes, cudaMemcpyHostToDevice));
+        __half alpha = __float2half(1.0f);
+        run_gemm(h, n, iters, "FP16", CUDA_R_16F, abytes, A, B, C, &alpha);
+        free(hA);
+        free(hB);
+        CHECK_CUDA(cudaFree(A));
+        CHECK_CUDA(cudaFree(B));
     }
-    CHECK_CUDA(cudaEventRecord(stop));
-    CHECK_CUDA(cudaEventSynchronize(stop));
 
-    float ms;
-    CHECK_CUDA(cudaEventElapsedTime(&ms, start, stop));
-    double flops = 2.0 * (double)n * n * n * iters;
-    double tflops = flops / (ms * 1e-3) / 1e12;
+    // ---- TF32: 32-bit float inputs, TF32 tensor cores, FP32 accumulation. ----
+    {
+        size_t abytes = nbytes * sizeof(float);
+        float *A, *B;
+        CHECK_CUDA(cudaMalloc(&A, abytes));
+        CHECK_CUDA(cudaMalloc(&B, abytes));
+        float *hA = (float *)malloc(abytes);
+        float *hB = (float *)malloc(abytes);
+        for (size_t i = 0; i < nbytes; i++) {
+            hA[i] = 0.5f;
+            hB[i] = 0.5f;
+        }
+        CHECK_CUDA(cudaMemcpy(A, hA, abytes, cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(B, hB, abytes, cudaMemcpyHostToDevice));
+        float alpha = 1.0f;
+        // TF32 tensor cores are selected via the math mode; inputs stay FP32.
+        CHECK_CUBLAS(cublasSetMathMode(h, CUBLAS_TF32_TENSOR_OP_MATH));
+        run_gemm(h, n, iters, "TF32", CUDA_R_32F, abytes, A, B, C, &alpha);
+        CHECK_CUBLAS(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH));
+        free(hA);
+        free(hB);
+        CHECK_CUDA(cudaFree(A));
+        CHECK_CUDA(cudaFree(B));
+    }
 
-    printf("GEMM %dx%d BF16 (FP32 accum), %d iters: %.1f ms total (%.2f ms each)\n",
-           n, n, iters, ms, ms / iters);
-    printf("BF16 tensor throughput: %.1f TFLOPS\n", tflops);
-    printf("\nCompare against the README table for your card.\n");
-    printf("If this is ~2x the locked value, the card is unlocked.\n");
-
-    free(hA);
-    free(hB);
-    CHECK_CUDA(cudaFree(A));
-    CHECK_CUDA(cudaFree(B));
     CHECK_CUDA(cudaFree(C));
     CHECK_CUBLAS(cublasDestroy(h));
+
+    printf("\nCompare against the README table for your card.\n");
+    printf("If these are ~2x the locked values, the card is unlocked.\n");
     return 0;
 }
