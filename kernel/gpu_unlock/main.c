@@ -53,11 +53,15 @@ static void unlock_one(void *data, async_cookie_t cookie)
 	pci_dev_lock(pdev);
 	ret = pdev->driver ? -EBUSY : gpu_unlock_610_unlock(&card->device, &shared, false);
 	pci_dev_unlock(pdev);
-	if (ret)
+	if (ret == -EALREADY)
+		pci_info(pdev, "gpu_unlock: already unlocked\n");
+	else if (ret)
 		pci_err(pdev, "gpu_unlock: unlock failed (%d)\n", ret);
 	else
 		pci_info(pdev, "gpu_unlock: unlocked\n");
-	card->unlocked = !ret;
+	/* -EALREADY means the card is already unlocked: keep it registered so
+	 * resume handling still applies, and don't report it as a failure. */
+	card->unlocked = !ret || ret == -EALREADY;
 }
 
 /* After resume, before nvidia resumes the card it suspended. Losing power in

@@ -83,6 +83,7 @@ struct unlock_transaction_work {
 	bool frts_saved, invocation_halted;
 	bool firmware_started;
 	bool retained;
+	bool no_flr;
 	bool error_reported;
 	u32 bars[6];
 	u32 last_offset, last_value;
@@ -667,9 +668,17 @@ static int unlock_transaction_claim(struct unlock_transaction_work *work)
 		return GU_RESULT(-EOPNOTSUPP);
 	if ((work->pdev->dev_flags & PCI_DEV_FLAGS_NO_FLR_RESET) ||
 	    !pci_is_pcie(work->pdev) ||
-	    diag_pci_dword(work, true, PCI_EXP_DEVCAP, &cap) ||
-	    !(cap & PCI_EXP_DEVCAP_FLR))
+	    diag_pci_dword(work, true, PCI_EXP_DEVCAP, &cap))
 		return GU_RESULT(-EOPNOTSUPP);
+	/* Hypervisor passthrough (XCP-ng/Xen, ESXi DirectPath I/O) masks the FLR
+	 * capability bit in the guest's view of PCI_EXP_DEVCAP. The card is
+	 * otherwise fully reachable, so proceed without FLR and warn loudly. */
+	if (!(cap & PCI_EXP_DEVCAP_FLR)) {
+		work->no_flr = true;
+		dev_warn(&work->pdev->dev,
+			 "gpu_unlock: FLR not advertised (DEVCAP=%#x); hypervisor passthrough, proceeding without FLR\n",
+			 cap);
+	}
 	if (diag_pci_word(work, false, PCI_COMMAND, &command) || command == 0xffff)
 		return GU_RESULT(-ENODEV);
 	work->original_cmd = command;
@@ -965,9 +974,11 @@ static int unlock_transaction_gfw(struct unlock_transaction_work *work)
 			dev_info(&work->pdev->dev,
 				 "gpu_unlock: stage=gfw plm=%#x ss0=%#x ss1=%#x wpr2_hi=%#x\n",
 				 plm, ss0, ss1, wpr_hi);
-			/* An open PLM means the card was already unlocked or not cold. */
+			/* An open PLM means the card was already unlocked or not cold.
+			 * Return directly (not via GU_RESULT) so the benign
+			 * already-unlocked case does not trigger the failure snapshot. */
 			if (plm == ~0u)
-				return GU_RESULT(-EALREADY);
+				return -EALREADY;
 			/* WPR2 is down from power-on until FWSEC-FRTS runs. An enabled
 			 * WPR2 means a driver has already used the card this power
 			 * cycle; starting FWSEC and Booter again from here is untested.
@@ -1479,6 +1490,15 @@ static int unlock_transaction_reset(struct unlock_transaction_work *work)
 
 	if (work->state != GU_STOCK)
 		return GU_RESULT(-EPROTO);
+	/* Hypervisor passthrough masks FLR and either rejects pcie_flr() (-EBUSY)
+	 * or emulates it as a no-op. The unlock selectors are already latched by
+	 * this point; skip the reset and let the unwind retain the DMA buffers and
+	 * pin the module until power off. */
+	if (work->no_flr) {
+		dev_warn(&work->pdev->dev,
+			 "gpu_unlock: FLR unavailable; skipping post-unlock reset (module will pin until power off)\n");
+		return 0;
+	}
 	if (read_bar(work, work->card->family->feat_ss0, &ss0) || ss0 == ~0u ||
 	    read_bar(work, work->card->family->feat_ss1, &ss1) || ss1 == ~0u)
 		return GU_RESULT(-ENODEV);
@@ -1516,8 +1536,15 @@ static int unlock_transaction_reset(struct unlock_transaction_work *work)
 	dev_dbg(&work->pdev->dev, "PCIe FLR begin: BME=0 DMA retained, chip=%#x\n", chip);
 	ret = pcie_flr(work->pdev);
 	dev_dbg(&work->pdev->dev, "PCIe FLR returned: result=%d\n", ret);
-	if (ret)
-		return GU_RESULT(ret);
+	if (ret) {
+		/* Hypervisor passthrough rejects FLR with -EBUSY. The unlock
+		 * selectors are already latched by this point; skip the post-FLR
+		 * reset and let the module pin itself until power-off. */
+		dev_warn(&work->pdev->dev,
+			 "gpu_unlock: FLR failed (%d); hypervisor passthrough, skipping post-FLR reset\n",
+			 ret);
+		return 0;
+	}
 	/* The saved image predates BME. No transient restore with BME set. */
 	pci_restore_state(work->pdev);
 	if (diag_pci_dword(work, false, PCI_VENDOR_ID, &identity) ||
